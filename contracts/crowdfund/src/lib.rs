@@ -72,6 +72,9 @@ impl CrowdfundContract {
         social_links: Option<Vec<String>>,
         platform_config: Option<PlatformConfig>,
         accepted_tokens: Option<Vec<Address>>,
+        category: Category,
+        vesting: Option<VestingSchedule>,
+        penalty_bps: Option<u32>,
     ) -> Result<(), ContractError> {
         if env.storage().instance().has(&KEY_CREATOR) {
             return Err(ContractError::AlreadyInitialized);
@@ -86,6 +89,11 @@ impl CrowdfundContract {
         }
         if min_contribution < 0 {
             return Err(ContractError::BelowMinimum);
+        }
+        if let Some(p) = penalty_bps {
+            if p > 10_000 {
+                return Err(ContractError::InvalidPenalty);
+            }
         }
 
         if let Some(ref config) = platform_config {
@@ -105,6 +113,7 @@ impl CrowdfundContract {
         env.storage().instance().set(&KEY_DESC, &description);
         env.storage().instance().set(&KEY_TOTAL, &0i128);
         env.storage().instance().set(&KEY_STATUS, &Status::Active);
+        env.storage().instance().set(&KEY_CATEGORY, &category);
         env.storage().instance().set(&DataKey::ContributorCount, &0u32);
         env.storage().instance().set(&DataKey::LargestContribution, &0i128);
 
@@ -112,15 +121,28 @@ impl CrowdfundContract {
             env.storage().instance().set(&KEY_SOCIAL, &links);
         }
 
-        env.storage().instance().set(&DataKey::ContributorCount, &0u32);
-        env.storage().instance().set(&DataKey::LargestContribution, &0i128);
-
         if let Some(tokens) = accepted_tokens {
             env.storage().instance().set(&DataKey::AcceptedTokens, &tokens);
         }
 
+        if let Some(v) = vesting {
+            env.storage().instance().set(&KEY_VESTING, &v);
+        }
+
+        if let Some(p) = penalty_bps {
+            env.storage().instance().set(&DataKey::PenaltyBps, &p);
+        }
+
         let empty: Vec<Address> = Vec::new(&env);
         env.storage().persistent().set(&KEY_CONTRIBS, &empty);
+
+        let mut history: Vec<GoalAdjustment> = Vec::new(&env);
+        history.push_back(GoalAdjustment {
+            previous_goal: 0,
+            new_goal: goal,
+            timestamp: env.ledger().timestamp(),
+        });
+        env.storage().persistent().set(&KEY_GOAL_HISTORY, &history);
 
         env.events().publish(("campaign", "initialized"), ());
         Ok(())
@@ -137,6 +159,7 @@ impl CrowdfundContract {
     /// * `contributor` - The contributor's Stellar address (must authorize)
     /// * `amount` - Contribution amount in stroops (must be >= min_contribution)
     /// * `token` - The token address being contributed (must match campaign token or be in whitelist)
+    /// * `anonymous` - Whether to hide this contribution from public lists
     ///
     /// # Returns
     /// * `Ok(())` on success
@@ -146,14 +169,16 @@ impl CrowdfundContract {
     /// * `Err(ContractError::CampaignEnded)` if current time >= deadline
     /// * `Err(ContractError::TokenNotAccepted)` if token not in whitelist
     /// * `Err(ContractError::Overflow)` if total raised would overflow
+    /// * `Err(ContractError::RateLimitExceeded)` if rate limit exceeded
     ///
     /// # Side Effects
     /// - Transfers tokens from contributor to contract
     /// - Updates contributor's total contribution amount
     /// - Increments contributor count if this is their first contribution
     /// - Updates largest contribution if applicable
+    /// - Stores anonymity flag if anonymous=true
     /// - Publishes "contributed" event
-    pub fn contribute(env: Env, contributor: Address, amount: i128, token: Address) -> Result<(), ContractError> {
+    pub fn contribute(env: Env, contributor: Address, amount: i128, token: Address, anonymous: bool) -> Result<(), ContractError> {
         contributor.require_auth();
 
         let min: i128 = env.storage().instance().get(&KEY_MIN).unwrap();
@@ -172,6 +197,26 @@ impl CrowdfundContract {
         let deadline: u64 = env.storage().instance().get(&KEY_DEADLINE).unwrap();
         if env.ledger().timestamp() >= deadline {
             return Err(ContractError::CampaignEnded);
+        }
+
+        // Check rate limit
+        if let Some(rate_limit) = env.storage().instance().get::<_, i128>(&KEY_RATE_LIMIT) {
+            let now = env.ledger().timestamp();
+            let ts_key = DataKey::RateLimitTimestamp(contributor.clone());
+            let last_ts: u64 = env.storage().persistent().get(&ts_key).unwrap_or(0);
+            
+            if now - last_ts < 3600 {
+                let amt_key = DataKey::RateLimitAmount(contributor.clone());
+                let period_amount: i128 = env.storage().persistent().get(&amt_key).unwrap_or(0);
+                if period_amount + amount > rate_limit {
+                    return Err(ContractError::RateLimitExceeded);
+                }
+                env.storage().persistent().set(&amt_key, &(period_amount + amount));
+            } else {
+                let amt_key = DataKey::RateLimitAmount(contributor.clone());
+                env.storage().persistent().set(&ts_key, &now);
+                env.storage().persistent().set(&amt_key, &amount);
+            }
         }
 
         // Validate token against whitelist if one is set, otherwise fall back to default token
@@ -220,30 +265,26 @@ impl CrowdfundContract {
             let count: u32 = env.storage().instance().get(&DataKey::ContributorCount).unwrap();
             env.storage().instance().set(&DataKey::ContributorCount, &(count + 1));
 
-            let mut contributors: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&KEY_CONTRIBS)
-                .unwrap_or_else(|| Vec::new(&env));
-            contributors.push_back(contributor.clone());
-            env.storage().persistent().set(&KEY_CONTRIBS, &contributors);
-            env.storage().persistent().extend_ttl(&KEY_CONTRIBS, 100, 100);
+            if !anonymous {
+                let mut contributors: Vec<Address> = env
+                    .storage()
+                    .persistent()
+                    .get(&KEY_CONTRIBS)
+                    .unwrap_or_else(|| Vec::new(&env));
+                contributors.push_back(contributor.clone());
+                env.storage().persistent().set(&KEY_CONTRIBS, &contributors);
+                env.storage().persistent().extend_ttl(&KEY_CONTRIBS, 100, 100);
+            }
+        }
+
+        if anonymous {
+            env.storage().persistent().set(&DataKey::AnonymousContribution(contributor.clone()), &true);
+            env.storage().persistent().extend_ttl(&DataKey::AnonymousContribution(contributor.clone()), 100, 100);
         }
 
         let largest: i128 = env.storage().instance().get(&DataKey::LargestContribution).unwrap();
         if new_amount > largest {
             env.storage().instance().set(&DataKey::LargestContribution, &new_amount);
-        }
-
-        let mut contributors: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&KEY_CONTRIBS)
-            .unwrap_or_else(|| Vec::new(&env));
-        if !contributors.contains(&contributor) {
-            contributors.push_back(contributor.clone());
-            env.storage().persistent().set(&KEY_CONTRIBS, &contributors);
-            env.storage().persistent().extend_ttl(&KEY_CONTRIBS, 100, 100);
         }
 
         env.storage().instance().extend_ttl(17280, 518400);
@@ -302,22 +343,31 @@ impl CrowdfundContract {
         let token_address: Address = env.storage().instance().get(&KEY_TOKEN).unwrap();
         let token_client = token::Client::new(&env, &token_address);
 
-        let payout = if let Some(config) = env.storage().instance().get::<_, PlatformConfig>(&KEY_PLATFORM) {
+        let mut payout = total;
+        if let Some(config) = env.storage().instance().get::<_, PlatformConfig>(&KEY_PLATFORM) {
             let fee = total * config.fee_bps as i128 / 10_000;
             token_client.transfer(&env.current_contract_address(), &config.address, &fee);
-            total - fee
+            payout = total - fee;
+        }
+
+        // Apply vesting if configured
+        if let Some(vesting) = env.storage().instance().get::<_, VestingSchedule>(&KEY_VESTING) {
+            let now = env.ledger().timestamp();
+            if now < vesting.cliff {
+                return Err(ContractError::VestingNotComplete);
+            }
+            let vested = if now >= vesting.cliff + vesting.duration {
+                payout
+            } else {
+                let elapsed = now - vesting.cliff;
+                payout * elapsed as i128 / vesting.duration as i128
+            };
+            token_client.transfer(&env.current_contract_address(), &creator, &vested);
         } else {
-            total
-        };
+            token_client.transfer(&env.current_contract_address(), &creator, &payout);
+        }
 
-        token_client.transfer(&env.current_contract_address(), &creator, &payout);
-
-        // Extend instance storage TTL after successful withdrawal.
-        // This ensures contract metadata remains accessible for historical reference
-        // and potential future interactions (e.g., viewing campaign results).
-        // Uses same TTL strategy as contribute: threshold 17280, extension 518400 ledgers.
         env.storage().instance().extend_ttl(17280, 518400);
-
         env.storage().instance().set(&KEY_TOTAL, &0i128);
         env.storage().instance().set(&KEY_STATUS, &Status::Successful);
         env.storage().instance().extend_ttl(17280, 518400);
@@ -530,7 +580,121 @@ impl CrowdfundContract {
         Ok(refunded)
     }
 
-    /// Pauses the campaign, preventing new contributions.
+    /// Sets the rate limit for contributions per hour (admin only).
+    ///
+    /// Configures the maximum amount a single address can contribute within a 1-hour window.
+    /// Set to 0 to disable rate limiting.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `max_amount_per_hour` - Maximum contribution amount per hour in stroops (0 = disabled)
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    ///
+    /// # Side Effects
+    /// - Updates rate limit configuration
+    /// - Publishes "RateLimitUpdated" event
+    pub fn set_rate_limit(env: Env, max_amount_per_hour: i128) -> Result<(), ContractError> {
+        let admin: Address = env.storage().instance().get(&KEY_ADMIN).unwrap();
+        admin.require_auth();
+        
+        if max_amount_per_hour > 0 {
+            env.storage().instance().set(&KEY_RATE_LIMIT, &max_amount_per_hour);
+        } else {
+            env.storage().instance().set(&KEY_RATE_LIMIT, &0i128);
+        }
+        env.events().publish(("campaign", "rate_limit_updated"), max_amount_per_hour);
+        Ok(())
+    }
+
+    /// Initiates an emergency withdrawal (admin only).
+    ///
+    /// Starts a time-locked emergency withdrawal process. After the lock period expires,
+    /// the admin can call `execute_emergency_withdrawal()` to recover funds.
+    /// This requires admin authorization and can be cancelled before execution.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `lock_period` - Time in seconds to lock the withdrawal (e.g., 604800 for 7 days)
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    ///
+    /// # Side Effects
+    /// - Sets emergency lock time to current time + lock_period
+    /// - Publishes "EmergencyWithdrawalInitiated" event
+    pub fn initiate_emergency_withdrawal(env: Env, lock_period: u64) -> Result<(), ContractError> {
+        let admin: Address = env.storage().instance().get(&KEY_ADMIN).unwrap();
+        admin.require_auth();
+        
+        let lock_time = env.ledger().timestamp() + lock_period;
+        env.storage().instance().set(&DataKey::EmergencyLockTime, &lock_time);
+        env.events().publish(("campaign", "emergency_initiated"), lock_time);
+        Ok(())
+    }
+
+    /// Executes the emergency withdrawal (admin only).
+    ///
+    /// Transfers all funds to the admin after the lock period has expired.
+    /// Can only be called after the time-lock delay has passed.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(ContractError::EmergencyLocked)` if lock period has not expired
+    ///
+    /// # Side Effects
+    /// - Transfers all funds to admin
+    /// - Clears emergency lock time
+    /// - Publishes "EmergencyWithdrawalExecuted" event
+    pub fn execute_emergency_withdrawal(env: Env) -> Result<(), ContractError> {
+        let admin: Address = env.storage().instance().get(&KEY_ADMIN).unwrap();
+        admin.require_auth();
+        
+        let lock_time: u64 = env.storage().instance().get(&DataKey::EmergencyLockTime).unwrap_or(0);
+        if lock_time == 0 || env.ledger().timestamp() < lock_time {
+            return Err(ContractError::EmergencyLocked);
+        }
+        
+        let total: i128 = env.storage().instance().get(&KEY_TOTAL).unwrap();
+        if total > 0 {
+            let token_address: Address = env.storage().instance().get(&KEY_TOKEN).unwrap();
+            token::Client::new(&env, &token_address)
+                .transfer(&env.current_contract_address(), &admin, &total);
+            env.storage().instance().set(&KEY_TOTAL, &0i128);
+        }
+        
+        env.storage().instance().set(&DataKey::EmergencyLockTime, &0u64);
+        env.events().publish(("campaign", "emergency_executed"), total);
+        Ok(())
+    }
+
+    /// Cancels a pending emergency withdrawal (admin only).
+    ///
+    /// Removes the emergency lock, preventing the withdrawal from being executed.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    ///
+    /// # Side Effects
+    /// - Clears emergency lock time
+    /// - Publishes "EmergencyWithdrawalCancelled" event
+    pub fn cancel_emergency_withdrawal(env: Env) -> Result<(), ContractError> {
+        let admin: Address = env.storage().instance().get(&KEY_ADMIN).unwrap();
+        admin.require_auth();
+        
+        env.storage().instance().set(&DataKey::EmergencyLockTime, &0u64);
+        env.events().publish(("campaign", "emergency_cancelled"), ());
+        Ok(())
+    }
+
+    /// Verify campaign (admin only).
     ///
     /// Can only be called while the campaign is in Active status.
     /// The admin (creator) must authorize this transaction.
@@ -1086,10 +1250,10 @@ impl CrowdfundContract {
             .get(&KEY_DESC)
             .unwrap_or_else(|| String::from_str(&env, ""));
         let status: Status = env.storage().instance().get(&KEY_STATUS).unwrap();
-        
-        let platform_config: Option<PlatformConfig> = env.storage()
+        let category: Category = env.storage()
             .instance()
-            .get(&KEY_PLATFORM);
+            .get(&KEY_CATEGORY)
+            .unwrap_or(Category::Other);
 
         let (has_platform_config, platform_fee_bps, platform_address) =
             if let Some(config) = env.storage().instance().get::<_, PlatformConfig>(&KEY_PLATFORM) {
@@ -1110,7 +1274,61 @@ impl CrowdfundContract {
             has_platform_config,
             platform_fee_bps,
             platform_address,
+            category,
         }
+    }
+
+    /// Returns the campaign category.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// Campaign category
+    pub fn get_category(env: Env) -> Category {
+        env.storage()
+            .instance()
+            .get(&KEY_CATEGORY)
+            .unwrap_or(Category::Other)
+    }
+
+    /// Returns the vesting schedule (if configured).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// Optional VestingSchedule with cliff and duration
+    pub fn get_vesting_info(env: Env) -> Option<VestingSchedule> {
+        env.storage().instance().get(&KEY_VESTING)
+    }
+
+    /// Returns the goal adjustment history.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// Vector of GoalAdjustment entries
+    pub fn get_goal_history(env: Env) -> Vec<GoalAdjustment> {
+        env.storage()
+            .persistent()
+            .get(&KEY_GOAL_HISTORY)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns the penalty fee in basis points (if configured).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// Penalty fee in basis points, or 0 if not configured
+    pub fn get_penalty_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PenaltyBps)
+            .unwrap_or(0)
     }
 
     /// Returns a paginated list of contributor addresses.
@@ -1153,6 +1371,94 @@ impl CrowdfundContract {
             result.push_back(contributors.get(i).unwrap());
         }
         result
+    }
+
+    /// Returns whether the campaign is verified.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// true if campaign is verified, false otherwise
+    pub fn is_verified(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Verified)
+            .unwrap_or(false)
+    }
+
+    /// Returns whether a contribution is anonymous.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `contributor` - The contributor's address
+    ///
+    /// # Returns
+    /// true if contribution is anonymous, false otherwise
+    pub fn is_anonymous_contributor(env: Env, contributor: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AnonymousContribution(contributor))
+            .unwrap_or(false)
+    }
+
+    /// Returns the count of anonymous contributions.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// Number of anonymous contributions
+    pub fn anonymous_contribution_count(env: Env) -> u32 {
+        let contributors: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&KEY_CONTRIBS)
+            .unwrap_or_else(|| Vec::new(&env));
+        
+        let mut count = 0u32;
+        let total_contributors: u32 = env.storage().instance().get(&DataKey::ContributorCount).unwrap_or(0);
+        
+        for i in 0..total_contributors {
+            if let Ok(Some(contrib)) = env.storage().persistent().get::<_, Address>(&DataKey::Contribution(contributors.get(i).unwrap())) {
+                if env.storage()
+                    .persistent()
+                    .get::<_, bool>(&DataKey::AnonymousContribution(contrib))
+                    .unwrap_or(false)
+                {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Returns the emergency withdrawal lock time (0 if not initiated).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// Unix timestamp when emergency withdrawal can be executed, or 0 if not initiated
+    pub fn emergency_lock_time(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::EmergencyLockTime)
+            .unwrap_or(0)
+    }
+
+    /// Returns the current rate limit configuration.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// Maximum contribution amount per hour in stroops, or 0 if disabled
+    pub fn rate_limit(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&KEY_RATE_LIMIT)
+            .unwrap_or(0)
     }
 }
 
