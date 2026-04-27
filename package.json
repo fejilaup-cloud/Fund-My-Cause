@@ -25,7 +25,7 @@
   },
   "lint-staged": {
     "apps/interface/**/*.{ts,tsx}": [
-      "eslint --max-warnings=0",
+      "eslint --config apps/interface/eslint.config.js --max-warnings=0",
       "prettier --write"
     ],
     "*.rs": [
