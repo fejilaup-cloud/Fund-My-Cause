@@ -216,6 +216,42 @@ pub struct Delegation {
     pub active: bool,
 }
 
+/// Reward tier for contribution amounts.
+///
+/// Defines a named reward tier that contributors reach based on their total
+/// cumulative contribution.  Tiers should be stored sorted by `min_amount`
+/// in ascending order.
+///
+/// # Example
+/// ```ignore
+/// // Bronze: ≥ 100 stroops, Silver: ≥ 1_000, Gold: ≥ 10_000
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+#[contracttype]
+pub struct RewardTier {
+    /// Minimum cumulative contribution required to qualify (in stroops)
+    pub min_amount: i128,
+    /// Short display name for the tier (e.g. "Bronze", "Silver", "Gold")
+    pub name: String,
+    /// Human-readable description of what this tier unlocks
+    pub description: String,
+}
+
+/// An immutable record of a single contribution.
+///
+/// Appended to each contributor's persistent history every time they call
+/// [`contribute`](crate::CrowdfundContract::contribute).
+#[derive(Clone)]
+#[contracttype]
+pub struct ContributionRecord {
+    /// Amount transferred in this contribution (in stroops)
+    pub amount: i128,
+    /// Ledger timestamp at the moment the contribution was accepted
+    pub timestamp: u64,
+    /// Contributor's cumulative total after this contribution
+    pub running_total: i128,
+}
+
 /// Storage key variants for contract data.
 ///
 /// Used to organize persistent and instance storage in the contract.
@@ -270,6 +306,12 @@ pub enum DataKey {
     TotalMatched,
     /// Penalty basis points
     PenaltyBps,
+    /// Ordered list of reward tiers configured by the creator
+    RewardTiers,
+    /// Best reward tier currently assigned to a specific contributor
+    ContributorTier(Address),
+    /// Full contribution history for a specific contributor
+    ContributionHistory(Address),
     /// Required number of approvals for emergency withdrawal multi-sig
     EmergencyApproversRequired,
     /// Running approval count for the active emergency withdrawal session
